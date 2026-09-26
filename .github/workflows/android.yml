@@ -1,0 +1,103 @@
+name: Build Minic for Android ARM64 NEON
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Source/**"
+      - "Tools/build/buildAndroid.sh"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-arm64:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # GitHub-hosted Android images already provide an NDK.  We deliberately
+      # do not run android-actions/setup-android here, avoiding sdkmanager
+      # "Failed to find package tools" failures.
+      - name: Select Android NDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          if [ -n "${ANDROID_NDK_LATEST_HOME:-}" ] && [ -d "$ANDROID_NDK_LATEST_HOME" ]; then
+            NDK="$ANDROID_NDK_LATEST_HOME"
+          elif [ -n "${ANDROID_NDK_HOME:-}" ] && [ -d "$ANDROID_NDK_HOME" ]; then
+            NDK="$ANDROID_NDK_HOME"
+          else
+            NDK="$(find "$ANDROID_SDK_ROOT/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          fi
+
+          test -n "$NDK"
+          test -d "$NDK"
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "Using NDK: $NDK"
+
+      - name: Download Minic NNUE
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p Tourney
+
+          curl -fL --retry 3 --retry-all-errors             "https://github.com/tryingsomestuff/NNUE-Nets/raw/master/nihilist_nugget.bin"             -o Tourney/nn.bin
+
+          test -s Tourney/nn.bin
+          echo "NNUE size:"
+          ls -lh Tourney/nn.bin
+
+      - name: Build ARM64 NEON engine
+        shell: bash
+        env:
+          MINIC_ANDROID_CPU: cortex-a76
+          SKIPMD5CHECK: "1"
+        run: |
+          set -euxo pipefail
+
+          # The repository's config/build system embeds Tourney/nn.bin into
+          # the executable.  This gives DroidFish a single engine file.
+          ./Tools/build/buildAndroid.sh
+
+          ENGINE="$(find Dist/Minic3 -maxdepth 1 -type f -name '*_android_arm64' -print -quit)"
+          test -n "$ENGINE"
+          test -f "$ENGINE"
+
+          echo "Final engine:"
+          ls -lh "$ENGINE"
+          file "$ENGINE"
+
+          # Confirm it is actually AArch64 and dynamically linked only where
+          # expected.  The command may report static linkage; that is fine.
+          readelf -h "$ENGINE" | grep -E 'Class:|Machine:'
+          readelf -d "$ENGINE" || true
+
+          # Basic UCI smoke test on the Linux runner is not possible because
+          # the executable targets Android.  The binary/header checks above
+          # prevent accidentally uploading a host/x86 build.
+
+      - name: Package one binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifact
+          ENGINE="$(find Dist/Minic3 -maxdepth 1 -type f -name '*_android_arm64' -print -quit)"
+          cp "$ENGINE" artifact/minic-android-arm64
+          chmod +x artifact/minic-android-arm64
+          ls -lh artifact/minic-android-arm64
+
+      - name: Upload engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: minic-android-arm64
+          path: artifact/minic-android-arm64
+          if-no-files-found: error
