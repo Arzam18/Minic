@@ -2,6 +2,10 @@
 
 #include <cstring>
 
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+#include <arm_neon.h>
+#endif
+
 // Highly inspired by/copied from https://github.com/xianyi/OpenBLAS, same naming convention here.
 
 /*
@@ -225,6 +229,87 @@ template<size_t N, bool Q>
 #endif
 
 //----------------------------------
+// ARM NEON (128-bit)
+//----------------------------------
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+#define V_SIMD_NEON_128 128
+using v_f32_128 = float32x4_t;
+inline constexpr auto v_nlanes_f32_128 = 4;
+#define v_add_f32_128    vaddq_f32
+#define v_mul_f32_128    vmulq_f32
+#if defined(__ARM_FEATURE_FMA)
+#define v_muladd_f32_128 vfmaq_f32
+#else
+FORCE_FINLINE float32x4_t v_muladd_f32_128(float32x4_t a, float32x4_t b, float32x4_t c) {
+   return vaddq_f32(vmulq_f32(a, b), c);
+}
+#endif
+FORCE_FINLINE float v_sum_f32_128(float32x4_t a) {
+   const float32x2_t halves = vadd_f32(vget_low_f32(a), vget_high_f32(a));
+   return vget_lane_f32(vpadd_f32(halves, halves), 0);
+}
+#define v_load_f32_128(PTR)  vld1q_f32(PTR)
+#define v_store_f32_128      vst1q_f32
+#define v_zero_f32_128()     vdupq_n_f32(0.0f)
+#define v_set_f32_128        vdupq_n_f32
+#define v_max_f32_128        vmaxq_f32
+#define v_min_f32_128        vminq_f32
+
+template<bool Q>
+FORCE_FINLINE void simdClippedReLU128Helper(float* RESTRICT x, const v_f32_128& zero, const v_f32_128& un) {
+   v_store_f32_128(x, v_max_f32_128(zero, v_min_f32_128(un, v_load_f32_128(x))));
+}
+
+template<size_t N, bool Q>
+void simdActivation128(float* RESTRICT x, const v_f32_128& zero, const v_f32_128& un) {
+   constexpr int vstep = v_nlanes_f32_128;
+   constexpr int unrollx4 = N & (-vstep * 4);
+   constexpr int unrollx = N & -vstep;
+   int i = 0;
+   if constexpr (unrollx4) {
+      while (i < unrollx4) {
+         simdClippedReLU128Helper<Q>(x + i, zero, un);
+         simdClippedReLU128Helper<Q>(x + i + vstep, zero, un);
+         simdClippedReLU128Helper<Q>(x + i + vstep * 2, zero, un);
+         simdClippedReLU128Helper<Q>(x + i + vstep * 3, zero, un);
+         i += vstep * 4;
+      }
+   }
+   while (i < unrollx) {
+      simdClippedReLU128Helper<Q>(x + i, zero, un);
+      i += vstep;
+   }
+}
+
+template<size_t N, bool Q>
+[[nodiscard]] float simdDotProduct128(const float* RESTRICT x, const float* RESTRICT y) {
+   constexpr int vstep = v_nlanes_f32_128;
+   constexpr int unrollx4 = N & (-vstep * 4);
+   constexpr int unrollx = N & -vstep;
+   int i = 0;
+   v_f32_128 vsum0 = v_zero_f32_128();
+   if constexpr (unrollx4) {
+      v_f32_128 vsum1 = v_zero_f32_128();
+      v_f32_128 vsum2 = v_zero_f32_128();
+      v_f32_128 vsum3 = v_zero_f32_128();
+      while (i < unrollx4) {
+         vsum0 = v_muladd_f32_128(v_load_f32_128(x + i), v_load_f32_128(y + i), vsum0);
+         vsum1 = v_muladd_f32_128(v_load_f32_128(x + i + vstep), v_load_f32_128(y + i + vstep), vsum1);
+         vsum2 = v_muladd_f32_128(v_load_f32_128(x + i + vstep * 2), v_load_f32_128(y + i + vstep * 2), vsum2);
+         vsum3 = v_muladd_f32_128(v_load_f32_128(x + i + vstep * 3), v_load_f32_128(y + i + vstep * 3), vsum3);
+         i += vstep * 4;
+      }
+      vsum0 = v_add_f32_128(v_add_f32_128(vsum0, vsum1), v_add_f32_128(vsum2, vsum3));
+   }
+   while (i < unrollx) {
+      vsum0 = v_muladd_f32_128(v_load_f32_128(x + i), v_load_f32_128(y + i), vsum0);
+      i += vstep;
+   }
+   return v_sum_f32_128(vsum0);
+}
+#endif
+
+//----------------------------------
 // SSE
 //----------------------------------
 #if defined(__SSE2__)
@@ -353,6 +438,14 @@ template<size_t N, bool Q>
 template<size_t N>
 FORCE_FINLINE void simdAdd_i16(int16_t* RESTRICT dst, const int16_t* RESTRICT src) {
    size_t i = 0;
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+   constexpr size_t vstep = 8;
+   while (i + vstep <= N) {
+      vst1q_s16(dst + i, vaddq_s16(vld1q_s16(dst + i), vld1q_s16(src + i)));
+      i += vstep;
+   }
+#else
+
 #if V_SIMD_256
    constexpr size_t vstep = 16; // 256 bits / 16 bits
    constexpr size_t unrollx4 = N & (-vstep * 4);
@@ -378,6 +471,7 @@ FORCE_FINLINE void simdAdd_i16(int16_t* RESTRICT dst, const int16_t* RESTRICT sr
       i += vstep128;
    }
 #endif
+#endif
    const size_t tail = N - i;
    for (size_t j = 0; j < tail; ++j) dst[i + j] += src[i + j];
 }
@@ -385,6 +479,14 @@ FORCE_FINLINE void simdAdd_i16(int16_t* RESTRICT dst, const int16_t* RESTRICT sr
 template<size_t N>
 FORCE_FINLINE void simdSub_i16(int16_t* RESTRICT dst, const int16_t* RESTRICT src) {
    size_t i = 0;
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+   constexpr size_t vstep = 8;
+   while (i + vstep <= N) {
+      vst1q_s16(dst + i, vsubq_s16(vld1q_s16(dst + i), vld1q_s16(src + i)));
+      i += vstep;
+   }
+#else
+
 #if V_SIMD_256
    constexpr size_t vstep = 16;
    constexpr size_t unrollx4 = N & (-vstep * 4);
@@ -410,6 +512,7 @@ FORCE_FINLINE void simdSub_i16(int16_t* RESTRICT dst, const int16_t* RESTRICT sr
       i += vstep128;
    }
 #endif
+#endif
    const size_t tail = N - i;
    for (size_t j = 0; j < tail; ++j) dst[i + j] -= src[i + j];
 }
@@ -417,6 +520,14 @@ FORCE_FINLINE void simdSub_i16(int16_t* RESTRICT dst, const int16_t* RESTRICT sr
 template<size_t N>
 FORCE_FINLINE void simdCopy_i16(int16_t* RESTRICT dst, const int16_t* RESTRICT src) {
    size_t i = 0;
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+   constexpr size_t vstep = 8;
+   while (i + vstep <= N) {
+      vst1q_s16(dst + i, vld1q_s16(src + i));
+      i += vstep;
+   }
+#else
+
 #if V_SIMD_256
    constexpr size_t vstep = 16;
    while (i + vstep <= N) {
@@ -431,6 +542,7 @@ FORCE_FINLINE void simdCopy_i16(int16_t* RESTRICT dst, const int16_t* RESTRICT s
       i += vstep128;
    }
 #endif
+#endif
    const size_t tail = N - i;
    if (tail) std::memcpy(dst + i, src + i, tail * sizeof(int16_t));
 }
@@ -438,6 +550,14 @@ FORCE_FINLINE void simdCopy_i16(int16_t* RESTRICT dst, const int16_t* RESTRICT s
 template<size_t N>
 FORCE_FINLINE void simdCopy_f32(float* RESTRICT dst, const float* RESTRICT src) {
    size_t i = 0;
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+   constexpr size_t vstep = 4;
+   while (i + vstep <= N) {
+      vst1q_f32(dst + i, vld1q_f32(src + i));
+      i += vstep;
+   }
+#else
+
 #if V_SIMD_256
    constexpr size_t vstep = 8;
    while (i + vstep <= N) {
@@ -452,6 +572,7 @@ FORCE_FINLINE void simdCopy_f32(float* RESTRICT dst, const float* RESTRICT src) 
       i += vstep128;
    }
 #endif
+#endif
    const size_t tail = N - i;
    if (tail) std::memcpy(dst + i, src + i, tail * sizeof(float));
 }
@@ -459,6 +580,17 @@ FORCE_FINLINE void simdCopy_f32(float* RESTRICT dst, const float* RESTRICT src) 
 template<size_t N>
 FORCE_FINLINE void simdDequantize_i16_f32(float* RESTRICT dst, const int16_t* RESTRICT src, const float scale) {
    size_t i = 0;
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+   constexpr size_t vstep = 4;
+   const float32x4_t vscale = vdupq_n_f32(scale);
+   while (i + vstep <= N) {
+      const int32x4_t src_i32 = vmovl_s16(vld1_s16(src + i));
+      const float32x4_t src_f32 = vcvtq_f32_s32(src_i32);
+      vst1q_f32(dst + i, vmulq_f32(src_f32, vscale));
+      i += vstep;
+   }
+#else
+
 #if V_SIMD_256
    constexpr size_t vstep = 8; // 8 floats per __m256
    const __m256 vscale = _mm256_set1_ps(scale);
@@ -483,6 +615,7 @@ FORCE_FINLINE void simdDequantize_i16_f32(float* RESTRICT dst, const int16_t* RE
       i += vstep128;
    }
 #endif
+#endif
    const size_t tail = N - i;
    for (size_t j = 0; j < tail; ++j) dst[i + j] = scale * static_cast<float>(src[i + j]);
 }
@@ -496,6 +629,19 @@ FORCE_FINLINE void simdSplice_f32(float* RESTRICT dst, const float* RESTRICT a, 
 template<size_t N, bool Q>
 FORCE_FINLINE void simdDequantizeActivate_i16_f32(float* RESTRICT dst, const int16_t* RESTRICT src, const float scale) {
    size_t i = 0;
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+   constexpr size_t vstep = 4;
+   const float32x4_t vscale = vdupq_n_f32(scale);
+   const float32x4_t vzero = vdupq_n_f32(0.0f);
+   const float32x4_t vone = vdupq_n_f32(1.0f);
+   while (i + vstep <= N) {
+      const int32x4_t src_i32 = vmovl_s16(vld1_s16(src + i));
+      const float32x4_t deq = vmulq_f32(vcvtq_f32_s32(src_i32), vscale);
+      vst1q_f32(dst + i, vmaxq_f32(vzero, vminq_f32(vone, deq)));
+      i += vstep;
+   }
+#else
+
 #if V_SIMD_256
    constexpr size_t vstep = 8;
    const __m256 vscale = _mm256_set1_ps(scale);
@@ -522,6 +668,7 @@ FORCE_FINLINE void simdDequantizeActivate_i16_f32(float* RESTRICT dst, const int
       i += vstep128;
    }
 #endif
+#endif
    const size_t tail = N - i;
    for (size_t j = 0; j < tail; ++j) {
       const float deq = scale * static_cast<float>(src[i + j]);
@@ -533,6 +680,14 @@ template<size_t N, bool Q>
 void simdActivation(float* RESTRICT x) {
    size_t i = 0;
    if constexpr (N <= 0) return;
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+   if (N - i >= 4) {
+      const v_f32_128 zero = v_zero_f32_128();
+      const v_f32_128 un = v_set_f32_128(1.f);
+      simdActivation128<N, Q>(x + i, zero, un);
+      i += ((N - i) & -4);
+   }
+#endif
 
 #if V_SIMD_512
    if (N-i >= 16){
@@ -577,6 +732,12 @@ template<size_t N, bool Q>
    size_t i = 0;
    float dot = 0.0f;
    if constexpr (N <= 0) return dot;
+#if defined(__ARM_NEON) && !defined(__SSE2__)
+   if (N - i >= 4) {
+      dot += simdDotProduct128<N, Q>(x + i, y + i);
+      i += ((N - i) & -4);
+   }
+#endif
 
 #if V_SIMD_512
    if (N-i >= 16){
