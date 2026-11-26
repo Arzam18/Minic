@@ -1,0 +1,91 @@
+name: Build Minic for Android ARM64 NEON
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Source/**"
+      - "Tools/build/buildAndroid.sh"
+      - "Tools/build/buildFathomAndroid.sh"
+      - "Tools/build/common"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-arm64:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The GitHub-hosted Android image already has the NDK installed.
+      - name: Select Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+
+          if [[ -n "${ANDROID_NDK_LATEST_HOME:-}" && -d "${ANDROID_NDK_LATEST_HOME}" ]]; then
+            NDK="${ANDROID_NDK_LATEST_HOME}"
+          elif [[ -n "${ANDROID_NDK_HOME:-}" && -d "${ANDROID_NDK_HOME}" ]]; then
+            NDK="${ANDROID_NDK_HOME}"
+          else
+            NDK="$(find "${SDK_ROOT}/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          fi
+
+          test -n "${NDK}"
+          test -x "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          echo "ANDROID_NDK_HOME=${NDK}" >> "${GITHUB_ENV}"
+          echo "Using Android NDK: ${NDK}"
+
+      - name: Download and verify Minic NNUE
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Tourney
+
+          curl -fL --retry 3 --retry-all-errors \
+            "https://github.com/tryingsomestuff/NNUE-Nets/raw/master/nihilist_nugget.bin" \
+            -o Tourney/nn.bin
+
+          echo "7f72f8f439ae62d1a9503044043607ab  Tourney/nn.bin" | md5sum --check -
+          test -s Tourney/nn.bin
+          ls -lh Tourney/nn.bin
+
+      - name: Build Android ARM64 NEON engine
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ./Tools/build/buildAndroid.sh
+
+          ENGINE="Dist/Minic3/minic_dev_android_arm64"
+          test -s "${ENGINE}"
+          file "${ENGINE}"
+          readelf -h "${ENGINE}" | grep -E 'Class:|Machine:'
+          readelf -d "${ENGINE}" || true
+
+          # Fail if the executable is not an AArch64 ELF binary.
+          readelf -h "${ENGINE}" | grep -q 'Machine:.*AArch64'
+
+      - name: Package engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cp "Dist/Minic3/minic_dev_android_arm64" "artifact/minic-android-arm64-neon"
+          chmod +x "artifact/minic-android-arm64-neon"
+          ls -lh "artifact/minic-android-arm64-neon"
+
+      - name: Upload Android ARM64 NEON engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: minic-android-arm64-neon
+          path: artifact/minic-android-arm64-neon
+          if-no-files-found: error
